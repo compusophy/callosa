@@ -233,6 +233,13 @@ public/
 server.js          dependency-free static file server, for local development
 ```
 
+## History
+
+[`docs/archive/original-brief.md`](docs/archive/original-brief.md) is the brief
+this was scaffolded from, kept for reference. It is superseded — the model, the
+GPU kernels, the wire protocol, the pairing mechanism and the client language all
+changed. The archive notes the differences.
+
 ## Limits
 
 - 128-position KV cache; the UI shows what is left and a forward past the end is

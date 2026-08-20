@@ -1,3 +1,25 @@
+> **Archived — superseded. Not a description of this codebase.**
+>
+> This is the original brief the project was scaffolded from, kept for history.
+> The implementation diverged from it substantially; read [the README](../../README.md)
+> for what `callosa` actually is. The main differences:
+>
+> | the brief asked for | what exists |
+> |---|---|
+> | one 128x128 matmul per node | a 2-block transformer: RMSNorm, 4x32 RoPE attention over a KV cache, SwiGLU FFN, LM head |
+> | a 16x16 tiled matmul shader | a mat-vec kernel (batch-1 decode leaves 15/16 of a 16x16 workgroup idle), plus rmsnorm, attention, swiglu and rope kernels |
+> | `[u8 opcode, u32 seq_pos, u32 hidden_dim, f32...]` | a 12-byte versioned header with request-id correlation, `HELLO`/`RESET`/`ERROR` opcodes, and an int8 activation codec alongside f32 |
+> | a Node.js WebSocket signaling relay | no backend at all — peers pair over `BroadcastChannel` or by copying a blob between devices |
+> | `public/main.js` driving the UI | no application JavaScript; the client is Rust via `web-sys` |
+> | argmax over synthetic logits | temperature + top-k sampling over a real LM head |
+> | wgpu 22 | wgpu 23 |
+>
+> The sampler in the original implementation also added `sin(v + pos * 3.7)` to
+> the logits to manufacture variety, which is why replacing the model was the
+> first thing that changed.
+
+---
+
 Please scaffold and implement a complete, working Proof-of-Concept (PoC) for browser-based distributed GPU compute sharing using Rust, WebAssembly, WebGPU, and WebRTC.
 
 ### Goal
