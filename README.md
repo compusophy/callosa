@@ -45,11 +45,13 @@ npm run build   # wasm-pack build --target web --out-dir public/pkg
 npm start       # http://localhost:3000 (a plain static file server)
 ```
 
-Open the page in **two tabs**. They negotiate roles between themselves — the
-second tab notices node 0 is taken and adopts node 1 — then pair over WebRTC
-automatically. Press **run pipeline**.
+Opening the page mints a room and writes it into the URL. **That URL is the
+invitation**: open it on a second device — or scan the QR next to it with a
+phone — and the two halves pair by themselves. They negotiate roles between them
+(the second arrival notices node 0 is taken and adopts node 1), then press
+**run pipeline**.
 
-Add `?room=<name>` to run more than one pair at a time.
+Two tabs of the same URL in one browser works too.
 
 `server.js` is a development convenience only. It has no dependencies and does
 nothing but serve `public/` with correct MIME types; any static server works.
@@ -60,25 +62,54 @@ nothing but serve `public/` with correct MIME types; any static server works.
 npm run deploy   # builds, then: vercel deploy public --prod
 ```
 
-Static hosting, nothing else. `public/` is the whole artifact.
+`public/` is the whole client — static hosting, no functions.
 
-## Pairing without a server
+The relay deploys separately from [`relay/`](relay) (a Dockerfile is included;
+it runs anywhere that speaks WebSockets). Set `DEFAULT_RELAY` in
+`src/web/signal.rs` to your instance, or leave it and pass `?relay=` per visit.
 
-WebRTC needs the two peers introduced before they can talk, which normally means
-a signaling relay. Two ways around that, neither involving a backend:
+## Pairing
 
-| mode | how | for |
+WebRTC needs the two peers introduced before they can talk. Three ways to do it:
+
+| mode | how | reaches |
 |---|---|---|
-| **same browser** | SDP and ICE cross a `BroadcastChannel` between tabs on the same origin | the two-tab demo; zero configuration |
-| **copy / paste** | the description is packed into a base64url blob carried across by hand | two genuinely separate devices |
+| **relay** (default) | SDP crosses [`relay/`](relay), a small signaling server | any browser, any device |
+| **same browser** | SDP crosses a `BroadcastChannel` | other tabs in *this* browser only |
+| **copy / paste** | the description is packed into a base64url blob you carry across | anything, with no server at all |
 
-The WebRTC connection either mode negotiates is entirely real — real offer and
-answer, real ICE, real data channel. Only the introduction is local.
+The WebRTC connection is identical in all three — real offer and answer, real
+ICE, real data channel. They differ only in how the introduction happens.
 
-Copy/paste pairing is *non-trickle*: candidates cannot be sent incrementally, so
-the peer waits for ICE gathering to finish and the candidates ride inside the
-description. That wait is bounded, because a gatherer stuck on an unreachable
-STUN server would otherwise hang the handshake forever.
+`BroadcastChannel` is same-browser by construction: it cannot see Chrome from
+Edge, let alone a phone. That is what the relay is for, and why it is the
+default.
+
+### The relay is not in the data path
+
+It forwards SDP and nothing else. Once the data channel opens the peers talk
+directly, and the client **closes its signaling socket a few seconds later**.
+
+The consequence is the point: concurrent connections track how many peers are
+*currently pairing*, not how many exist. A measured pairing costs **four small
+messages**, after which the relay holds nothing for those peers at all. Scaling
+the network scales its join rate, not its steady-state load.
+
+Point it elsewhere with `?relay=wss://your-relay/ws`; there is nothing
+callosa-specific about it.
+
+### Rooms
+
+A fresh visit mints a random room id and pins it into the URL. On a shared relay
+a fixed default would be actively wrong — whoever arrived first would be paired
+with the next stranger to open the page.
+
+### Copy / paste
+
+This mode is *non-trickle*: candidates cannot be sent incrementally, so the peer
+waits for ICE gathering to finish and they ride inside the description. That wait
+is bounded, because a gatherer stuck on an unreachable STUN server would
+otherwise hang the handshake forever.
 
 ## The model
 
@@ -223,7 +254,7 @@ src/
   gpu/shaders/     kernels.wgsl (matvec, rmsnorm, add, swiglu, rope), attention.wgsl
   web/app.rs       the client: state, inference loop, every DOM update
   web/peer.rs      webrtc, ICE buffering, send backpressure, candidate stats
-  web/signal.rs    BroadcastChannel and copy/paste pairing
+  web/signal.rs    relay, BroadcastChannel and copy/paste pairing
   web/viz.rs       activation and latency canvases
   web/dom.rs       element refs, listeners, timers
 public/
@@ -231,6 +262,9 @@ public/
   style.css
   pkg/             wasm-pack output (built, not checked in)
 server.js          dependency-free static file server, for local development
+relay/
+  src/main.rs      the signaling server: rooms, limits, verbatim forwarding
+  Dockerfile       what Railway builds
 ```
 
 ## History
@@ -247,7 +281,9 @@ changed. The archive notes the differences.
 - Two stages. The split is `Role`-driven, so more stages means extending that
   enum and chaining the links, not restructuring the protocol.
 - `BroadcastChannel` pairing is same-origin and same-browser by construction.
-  Across devices, use copy/paste pairing.
+  Across devices, use the relay or copy/paste.
+- The relay keeps no state and has no authentication. Room ids are the only
+  thing standing between two sessions, which is why they are random.
 - No TURN server, so two peers behind symmetric NATs may fail to connect. STUN
   covers the common cases; the candidate path is shown in the topology panel so
   a failure is diagnosable rather than mysterious.

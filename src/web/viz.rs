@@ -102,6 +102,50 @@ pub fn draw_activations(canvas: &HtmlCanvasElement, values: &[f32], accent: &Acc
     }
 }
 
+/// Draw `text` as a QR code, sized to fill the canvas on whole-pixel modules.
+///
+/// Rendered here rather than fetched as an image so the page stays a single
+/// self-contained wasm bundle with no network dependency.
+pub fn draw_qr(canvas: &HtmlCanvasElement, text: &str) -> Result<(), String> {
+    let code = qrcode::QrCode::new(text.as_bytes())
+        .map_err(|e| format!("could not encode the invite as a qr code: {e}"))?;
+    let colors = code.to_colors();
+    let modules = code.width();
+
+    let Some((ctx, width, height)) = fit(canvas) else {
+        return Ok(());
+    };
+
+    // A quiet zone is part of the spec; scanners need it to find the symbol.
+    const QUIET: usize = 2;
+    let total = modules + QUIET * 2;
+    let side = width.min(height);
+    let scale = (side / total as f64).floor().max(1.0);
+    let drawn = scale * total as f64;
+    let origin_x = ((width - drawn) / 2.0).floor();
+    let origin_y = ((height - drawn) / 2.0).floor();
+
+    // White background, including the quiet zone: contrast is what gets scanned.
+    ctx.set_fill_style_str("#ffffff");
+    ctx.fill_rect(origin_x, origin_y, drawn, drawn);
+
+    ctx.set_fill_style_str("#05060a");
+    for (i, color) in colors.iter().enumerate() {
+        if *color == qrcode::Color::Light {
+            continue;
+        }
+        let x = (i % modules) + QUIET;
+        let y = (i / modules) + QUIET;
+        ctx.fill_rect(
+            origin_x + x as f64 * scale,
+            origin_y + y as f64 * scale,
+            scale,
+            scale,
+        );
+    }
+    Ok(())
+}
+
 /// Rolling latency history: total round trip with the two compute halves stacked.
 pub fn draw_latency(canvas: &HtmlCanvasElement, samples: &[LatencySample]) {
     let Some((ctx, width, height)) = fit(canvas) else {

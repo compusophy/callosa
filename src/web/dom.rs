@@ -254,6 +254,41 @@ pub fn query_param(name: &str) -> Option<String> {
     }
 }
 
+/// The page URL with `name` set to `value`, without reloading.
+///
+/// Used to pin a generated room into the address bar so the URL itself is the
+/// invitation: copy it, or scan it, and the other device lands in the same room.
+pub fn set_query_param(name: &str, value: &str) -> String {
+    let Ok(href) = window().location().href() else {
+        return String::new();
+    };
+    let Ok(url) = web_sys::Url::new(&href) else {
+        return String::new();
+    };
+    url.search_params().set(name, value);
+    let updated = url.href();
+
+    if let Ok(history) = window().history() {
+        let _ = history.replace_state_with_url(&JsValue::NULL, "", Some(&updated));
+    }
+    updated
+}
+
+/// A short, unambiguous room id.
+///
+/// Digits and letters that read alike are left out, because these get retyped
+/// off a phone screen. 8 characters of this alphabet is ~40 bits, which is
+/// plenty to keep strangers on a shared relay from colliding.
+pub fn random_room_id() -> String {
+    const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+    (0..8)
+        .map(|_| {
+            let i = (js_sys::Math::random() * ALPHABET.len() as f64) as usize;
+            ALPHABET[i.min(ALPHABET.len() - 1)] as char
+        })
+        .collect()
+}
+
 pub fn js_error_string(value: &JsValue) -> String {
     value
         .as_string()

@@ -93,7 +93,18 @@ pub struct App {
 impl App {
     pub fn boot() {
         let refs = Refs::collect();
-        let room = query_param("room").unwrap_or_else(|| "default".to_string());
+
+        // Without a room in the URL, invent one and write it back. A shared
+        // relay makes a fixed default actively wrong: whoever arrived first
+        // would be paired with the next stranger to open the page.
+        let room = match query_param("room") {
+            Some(room) => room,
+            None => {
+                let generated = super::dom::random_room_id();
+                super::dom::set_query_param("room", &generated);
+                generated
+            }
+        };
 
         let app = Rc::new(App {
             refs,
@@ -122,6 +133,7 @@ impl App {
 
         app.refs.set_value("roomInput", &room);
         app.pill("pillWasm", "ok", "rust/wasm: ready");
+        app.render_invite();
         app.render_spec_strip();
         app.wire_controls();
 
@@ -386,6 +398,7 @@ impl App {
         let transport = Transport::new(kind, &room, role.as_str(), sink);
         self.state.borrow_mut().transport = Some(transport);
 
+        self.render_invite();
         self.pill("pillSignal", "ok", &format!("pairing: {}", kind.label()));
         self.log(&format!("pairing via {}", kind.label()), Level::Info);
 
@@ -644,6 +657,30 @@ impl App {
             }
             PeerEvent::Frame(bytes) => self.on_frame(bytes).await,
             PeerEvent::Log(message) => self.log(&message, Level::Warn),
+        }
+    }
+
+    /// Show the URL that carries this room, plus a QR of it for phones.
+    ///
+    /// Only meaningful for transports that can reach another device; the
+    /// same-browser mode pairs tabs, not machines.
+    fn render_invite(&self) {
+        let kind = self.state.borrow().transport_kind;
+        let room = self.state.borrow().room.clone();
+        let show = kind != TransportKind::Broadcast;
+        self.refs.set_hidden("invitePanel", !show);
+        if !show {
+            return;
+        }
+
+        let url = super::dom::set_query_param("room", &room);
+        self.refs.set_value("inviteLink", &url);
+
+        match viz::draw_qr(&self.refs.canvas("inviteQr"), &url) {
+            Ok(()) => self
+                .refs
+                .set_text("inviteNote", &format!("room \u{201c}{room}\u{201d}")),
+            Err(err) => self.refs.set_text("inviteNote", &err),
         }
     }
 
@@ -1493,6 +1530,18 @@ impl App {
             }),
         );
         click(
+            "btnCopyInvite",
+            Box::new(|app| {
+                let text = app.refs.value("inviteLink");
+                if text.is_empty() {
+                    return;
+                }
+                let _ = window().navigator().clipboard().write_text(&text);
+                app.refs
+                    .set_text("inviteNote", "copied \u{2014} open it on the other device");
+            }),
+        );
+        click(
             "btnCopyBlob",
             Box::new(|app| {
                 let text = app.refs.value("manualOut");
@@ -1528,6 +1577,7 @@ impl App {
             Box::new(|app| {
                 let kind = app.state.borrow().transport_kind;
                 app.attach_transport(kind);
+                app.render_invite();
             }),
         );
         change("temperature", Box::new(|app| app.apply_sampler()));
@@ -1552,7 +1602,10 @@ impl App {
 
         let app = Rc::clone(self);
         let target: web_sys::EventTarget = window().into();
-        on_event(&target, "resize", move |_| app.redraw());
+        on_event(&target, "resize", move |_| {
+            app.redraw();
+            app.render_invite();
+        });
     }
 }
 

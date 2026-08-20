@@ -91,6 +91,24 @@
           </div>
           <p class="hint" data-ref="pairingHint"></p>
 
+          <!-- The URL is the invitation: it carries the room id. -->
+          <div class="invite" data-ref="invitePanel">
+            <div class="invite-body">
+              <div class="field">
+                <label for="inviteLink">invite link &mdash; open this on the other device</label>
+                <input type="text" id="inviteLink" data-ref="inviteLink" readonly spellcheck="false" />
+                <div class="btn-row">
+                  <button class="btn btn-primary" data-ref="btnCopyInvite">copy link</button>
+                  <span class="panel-note" data-ref="inviteNote">same room = paired</span>
+                </div>
+              </div>
+            </div>
+            <div class="invite-qr">
+              <canvas data-ref="inviteQr" width="180" height="180"></canvas>
+              <span class="panel-note">scan with a phone</span>
+            </div>
+          </div>
+
           <!-- shown only when pairing is set to copy / paste -->
           <div class="manual-pairing" data-ref="manualPanel" hidden>
             <div class="field">

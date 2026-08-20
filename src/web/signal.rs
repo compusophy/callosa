@@ -573,6 +573,10 @@ pub struct RelayTransport {
     sink: Sink,
     /// Retained so the callbacks outlive this scope.
     handlers: RefCell<Vec<JsHandler>>,
+    /// Consecutive failed attempts, for the backoff.
+    attempt: Rc<RefCell<u32>>,
+    /// Set once pairing succeeds, so a deliberate hang-up is not retried.
+    released: Rc<RefCell<bool>>,
 }
 
 impl RelayTransport {
@@ -583,6 +587,8 @@ impl RelayTransport {
             room: room.to_string(),
             sink,
             handlers: RefCell::new(Vec::new()),
+            attempt: Rc::new(RefCell::new(0)),
+            released: Rc::new(RefCell::new(false)),
         };
         transport.connect();
         transport
@@ -603,6 +609,15 @@ impl RelayTransport {
         };
 
         let mut handlers = self.handlers.borrow_mut();
+
+        let on_open = {
+            let attempt = Rc::clone(&self.attempt);
+            Closure::<dyn FnMut(JsValue)>::new(move |_: JsValue| {
+                *attempt.borrow_mut() = 0;
+            })
+        };
+        socket.set_onopen(Some(on_open.as_ref().unchecked_ref()));
+        handlers.push(on_open);
 
         let on_message = {
             let sink = Rc::clone(&self.sink);
@@ -674,6 +689,59 @@ impl RelayTransport {
         socket.set_onerror(Some(on_error.as_ref().unchecked_ref()));
         handlers.push(on_error);
 
+        // A relay restart or a flaky network should not strand a peer that has
+        // not paired yet; retry with backoff until it does.
+        let on_close = {
+            let attempt = Rc::clone(&self.attempt);
+            let released = Rc::clone(&self.released);
+            let sink = Rc::clone(&self.sink);
+            let room = self.room.clone();
+            let role = self.role.clone();
+            Closure::<dyn FnMut(JsValue)>::new(move |_: JsValue| {
+                if *released.borrow() {
+                    return;
+                }
+                let n = {
+                    let mut a = attempt.borrow_mut();
+                    *a = (*a + 1).min(6);
+                    *a
+                };
+                // 0.5s, 1s, 2s ... capped, with jitter so a relay coming back up
+                // does not get every client at the same instant.
+                let base = 500u32 << (n - 1).min(5);
+                let delay = base as f64 * (0.5 + js_sys::Math::random() * 0.5);
+
+                let attempt = Rc::clone(&attempt);
+                let released = Rc::clone(&released);
+                let sink = Rc::clone(&sink);
+                let room = room.clone();
+                let role = role.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    super::dom::sleep(delay as i32).await;
+                    if *released.borrow() {
+                        return;
+                    }
+                    // Rebuilding the transport re-runs `connect`; the old one is
+                    // dropped by the app when it swaps it in.
+                    let replacement = RelayTransport {
+                        socket: RefCell::new(None),
+                        role,
+                        room,
+                        sink: Rc::clone(&sink),
+                        handlers: RefCell::new(Vec::new()),
+                        attempt,
+                        released,
+                    };
+                    replacement.connect();
+                    // Hand ownership to the event loop: the closures inside keep
+                    // it alive for as long as the socket is open.
+                    std::mem::forget(replacement);
+                });
+            })
+        };
+        socket.set_onclose(Some(on_close.as_ref().unchecked_ref()));
+        handlers.push(on_close);
+
         drop(handlers);
         *self.socket.borrow_mut() = Some(socket);
     }
@@ -701,9 +769,12 @@ impl RelayTransport {
 
     /// Hang up. The peers are connected directly now and need nothing further.
     fn release(&self) {
+        *self.released.borrow_mut() = true;
         if let Some(socket) = self.socket.borrow_mut().take() {
+            socket.set_onopen(None);
             socket.set_onmessage(None);
             socket.set_onerror(None);
+            socket.set_onclose(None);
             let _ = socket.close();
         }
         self.handlers.borrow_mut().clear();

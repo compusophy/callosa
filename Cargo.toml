@@ -23,6 +23,8 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
+# Pure-Rust QR encoder so a phone can join by scanning rather than typing a url.
+qrcode = { version = "0.14", default-features = false }
 
 # The entire client lives in Rust, so the web-sys surface is broad: DOM, canvas,
 # WebRTC and BroadcastChannel are all driven from here rather than from JS.
@@ -49,6 +51,7 @@ features = [
   "MessageEvent",
   "Navigator",
   "Location",
+  "History",
   "Url",
   "UrlSearchParams",
   "BroadcastChannel",
