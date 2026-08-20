@@ -34,7 +34,8 @@ const MAX_LOG_LINES: usize = 400;
 const LATENCY_WINDOW: usize = 48;
 const REPLY_TIMEOUT_MS: i32 = 8000;
 
-const BROADCAST_HINT: &str = "open this page in a second tab and set it to node 1 \u{2014} the tabs find each other with no server involved. append ?room=name to run more than one pair at once.";
+const RELAY_HINT: &str = "works across browsers and devices. open this url on your phone or another machine \u{2014} same room name \u{2014} and the two pair automatically. the relay only introduces them; activations go peer to peer and it disconnects once you are paired.";
+const BROADCAST_HINT: &str = "two tabs in THIS browser only \u{2014} it cannot see other browsers or other devices. use relay or copy/paste for those.";
 const MANUAL_HINT: &str = "for two separate devices: node 0 creates a blob and sends it across; node 1 pastes it, applies, and sends its own blob back. nothing but the two browsers is involved.";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -143,7 +144,10 @@ impl App {
                 );
             }
             boot.initialise_shard().await;
-            boot.attach_transport(TransportKind::Broadcast);
+            // The relay is the only mode that reaches another browser or another
+            // device, so it is the default; the picker can switch away from it.
+            let kind = TransportKind::parse(&boot.refs.value("pairingMode"));
+            boot.attach_transport(kind);
             boot.redraw();
         });
     }
@@ -364,7 +368,11 @@ impl App {
         self.refs.set_value("manualIn", "");
         self.refs.set_text(
             "pairingHint",
-            if manual { MANUAL_HINT } else { BROADCAST_HINT },
+            match kind {
+                TransportKind::Manual => MANUAL_HINT,
+                TransportKind::Relay => RELAY_HINT,
+                TransportKind::Broadcast => BROADCAST_HINT,
+            },
         );
         self.refs.set_text(
             "btnPair",
@@ -380,6 +388,25 @@ impl App {
 
         self.pill("pillSignal", "ok", &format!("pairing: {}", kind.label()));
         self.log(&format!("pairing via {}", kind.label()), Level::Info);
+
+        if kind == TransportKind::Broadcast {
+            let app = Rc::clone(self);
+            spawn_local(async move {
+                super::dom::sleep(6000).await;
+                let looking = !app.state.borrow().peer_present
+                    && app.state.borrow().transport_kind == TransportKind::Broadcast;
+                if looking {
+                    app.banner(
+                        "warn",
+                        "no peer found. \u{201c}same browser\u{201d} pairing only sees other tabs in                          THIS browser \u{2014} it cannot reach a different browser or another device.                          switch pairing to \u{201c}relay\u{201d} for those.",
+                    );
+                    app.log(
+                        "no peer in this browser; other browsers and devices need relay pairing",
+                        Level::Warn,
+                    );
+                }
+            });
+        }
     }
 
     async fn on_signal(self: &Rc<Self>, event: SignalEvent) {
@@ -408,15 +435,17 @@ impl App {
                 self.refs.set_text("topologyNote", "peer disconnected");
                 self.teardown_link();
             }
-            SignalEvent::RoleTaken { role } => {
-                let free = if role == "node0" {
-                    Role::Node1
-                } else {
-                    Role::Node0
-                };
+            SignalEvent::RoleTaken => {
+                // Whatever the message calls it, the role that is taken is ours
+                // -- that is what the collision means -- so the free one is
+                // simply the other half of the pipeline. Deriving it from our
+                // own state means a transport that omits the name still works.
+                let taken = self.state.borrow().role;
+                let free = taken.other();
                 self.log(
                     &format!(
-                        "{role} is taken in this room; taking {} instead",
+                        "{} is taken in this room; taking {} instead",
+                        taken.as_str(),
                         free.as_str()
                     ),
                     Level::Warn,
@@ -467,6 +496,16 @@ impl App {
                     link.add_candidate(&json).await;
                 }
             }
+            SignalEvent::TransportError(message) => {
+                self.pill("pillSignal", "error", "pairing: relay unreachable");
+                self.banner(
+                    "error",
+                    &format!(
+                        "{message}. switch pairing to \u{201c}copy / paste\u{201d} to connect without a relay,                          or pass ?relay=wss://your-relay/ws to use another one."
+                    ),
+                );
+                self.log(&message, Level::Error);
+            }
             SignalEvent::Blob { kind, blob } => {
                 self.refs.set_value("manualOut", &blob);
                 self.refs.set_text(
@@ -493,11 +532,17 @@ impl App {
     /// a fresh offer. Rebuild it, but only from the offering side and only while
     /// the peer is still announcing itself.
     fn retry_pairing(self: &Rc<Self>) {
-        let (initiator, peer_present) = {
+        let (initiator, peer_present, kind) = {
             let state = self.state.borrow();
-            (state.initiator, state.peer_present)
+            (state.initiator, state.peer_present, state.transport_kind)
         };
-        if !initiator || !peer_present {
+        if !initiator {
+            return;
+        }
+        // The signaling socket is dropped once paired, so it has to come back
+        // before a fresh offer can reach anyone.
+        if !peer_present || kind == TransportKind::Relay {
+            self.attach_transport(kind);
             return;
         }
         let app = Rc::clone(self);
@@ -589,6 +634,7 @@ impl App {
                 self.announce_capabilities();
                 self.update_generate_button();
                 self.poll_transport_path();
+                self.release_signaling();
             }
             PeerEvent::ChannelClosed => {
                 self.refs.set_attr("bridgeWire", "data-live", "false");
@@ -599,6 +645,35 @@ impl App {
             PeerEvent::Frame(bytes) => self.on_frame(bytes).await,
             PeerEvent::Log(message) => self.log(&message, Level::Warn),
         }
+    }
+
+    /// Hang up the signaling connection a moment after pairing succeeds.
+    ///
+    /// The delay covers a link that fails immediately. After this the relay
+    /// holds no connection for this peer at all, so its concurrent load tracks
+    /// how many peers are *pairing* rather than how many exist.
+    fn release_signaling(self: &Rc<Self>) {
+        let app = Rc::clone(self);
+        spawn_local(async move {
+            super::dom::sleep(5000).await;
+            let still_open = app
+                .state
+                .borrow()
+                .peer
+                .as_ref()
+                .map(|p| p.is_open())
+                .unwrap_or(false);
+            if !still_open {
+                return;
+            }
+            if let Some(transport) = app.state.borrow().transport.as_ref() {
+                transport.release();
+            }
+            app.log(
+                "paired \u{2014} released the signaling connection; the relay is out of the loop",
+                Level::Info,
+            );
+        });
     }
 
     /// Report which route the data channel took, refreshed while it stays open.

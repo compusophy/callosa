@@ -5,6 +5,10 @@ edition = "2021"
 description = "Half a transformer per browser tab, with activations crossing a WebRTC data channel"
 repository = "https://github.com/compusophy/callosa"
 
+# The relay is a separate standalone crate; keep it out of this package's build.
+[workspace]
+exclude = ["relay"]
+
 [lib]
 crate-type = ["cdylib", "rlib"]
 
@@ -48,6 +52,7 @@ features = [
   "Url",
   "UrlSearchParams",
   "BroadcastChannel",
+  "WebSocket",
   "Clipboard",
   "RtcPeerConnection",
   "RtcConfiguration",

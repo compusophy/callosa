@@ -67,6 +67,14 @@ impl Role {
         }
     }
 
+    /// The other half of the pipeline.
+    pub fn other(self) -> Role {
+        match self {
+            Role::Node0 => Role::Node1,
+            Role::Node1 => Role::Node0,
+        }
+    }
+
     /// Index of the transformer block this shard executes.
     pub fn layer_index(self) -> usize {
         match self {

@@ -1,0 +1,19 @@
+[package]
+name = "callosa-relay"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal WebRTC signaling relay for callosa: introduces two peers, then gets out of the way"
+
+# Standalone workspace so this builds on its own, without the wasm crate above it.
+[workspace]
+
+[dependencies]
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

@@ -8,15 +8,17 @@
 //! * [`ManualTransport`] — for two genuinely separate devices, the description
 //!   is packed into a short text blob the user carries across by hand.
 //!
-//! The WebRTC connection either one negotiates is entirely real; only the
-//! introduction is local.
+//! [`RelayTransport`] covers the case those two cannot: different browsers, or
+//! different machines, without making the user ferry anything. It uses a
+//! signaling server, but only to introduce the peers — once the data channel is
+//! open the relay carries nothing, and the client disconnects from it.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{BroadcastChannel, MessageEvent};
+use web_sys::{BroadcastChannel, MessageEvent, WebSocket};
 
 use super::dom::{now_us, set_interval, IntervalHandle};
 
@@ -32,9 +34,10 @@ pub enum SignalEvent {
     },
     PeerJoined,
     PeerLeft,
-    RoleTaken {
-        role: String,
-    },
+    /// This peer's role is already occupied in the room. The name is not
+    /// carried: the taken role is always the local one, so a listener derives
+    /// the free half from its own state rather than trusting the wire.
+    RoleTaken,
     Offer(String),
     Answer(String),
     IceCandidate(String),
@@ -43,6 +46,8 @@ pub enum SignalEvent {
         kind: String,
         blob: String,
     },
+    /// The pairing channel itself failed, as opposed to the peer connection.
+    TransportError(String),
 }
 
 /// A signaling payload travelling between peers.
@@ -80,9 +85,16 @@ impl Signal {
 
 type Sink = Rc<dyn Fn(SignalEvent)>;
 
+/// A retained JS callback; dropping it detaches the listener.
+type JsHandler = Closure<dyn FnMut(JsValue)>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportKind {
+    /// Two tabs in one browser. Cannot see other browsers or other devices.
     Broadcast,
+    /// Any two peers, introduced by a signaling server.
+    Relay,
+    /// Any two peers, introduced by the user carrying a blob across.
     Manual,
 }
 
@@ -90,26 +102,29 @@ impl TransportKind {
     pub fn label(self) -> &'static str {
         match self {
             TransportKind::Broadcast => "same browser",
+            TransportKind::Relay => "relay",
             TransportKind::Manual => "copy / paste",
         }
     }
 
     pub fn parse(id: &str) -> TransportKind {
         match id {
+            "broadcast" => TransportKind::Broadcast,
             "manual" => TransportKind::Manual,
-            _ => TransportKind::Broadcast,
+            _ => TransportKind::Relay,
         }
     }
 
     /// Manual pairing cannot carry candidates incrementally, so the peer must
     /// wait for ICE gathering to finish before handing over a description.
     pub fn trickles(self) -> bool {
-        matches!(self, TransportKind::Broadcast)
+        !matches!(self, TransportKind::Manual)
     }
 }
 
 pub enum Transport {
     Broadcast(BroadcastTransport),
+    Relay(RelayTransport),
     Manual(ManualTransport),
 }
 
@@ -119,6 +134,7 @@ impl Transport {
             TransportKind::Broadcast => {
                 Transport::Broadcast(BroadcastTransport::new(room, role, sink))
             }
+            TransportKind::Relay => Transport::Relay(RelayTransport::new(room, role, sink)),
             TransportKind::Manual => Transport::Manual(ManualTransport::new(room, role, sink)),
         }
     }
@@ -126,7 +142,17 @@ impl Transport {
     pub fn send(&self, signal: Signal) {
         match self {
             Transport::Broadcast(t) => t.send(signal),
+            Transport::Relay(t) => t.send(signal),
             Transport::Manual(t) => t.send(signal),
+        }
+    }
+
+    /// Release the signaling connection once the peers are talking directly.
+    /// The relay's concurrent load then tracks peers that are *pairing*, not
+    /// peers that exist.
+    pub fn release(&self) {
+        if let Transport::Relay(t) = self {
+            t.release();
         }
     }
 
@@ -134,9 +160,17 @@ impl Transport {
     pub fn accept_blob(&self, text: &str) -> Result<String, String> {
         match self {
             Transport::Manual(t) => t.accept_blob(text),
-            Transport::Broadcast(_) => Err("this pairing mode does not use blobs".to_string()),
+            _ => Err("this pairing mode does not use blobs".to_string()),
         }
     }
+}
+
+/// Default signaling endpoint, overridable at runtime with `?relay=wss://...`
+/// so a fork can point at its own without rebuilding.
+pub const DEFAULT_RELAY: &str = "wss://callosa-relay.up.railway.app/ws";
+
+pub fn relay_endpoint() -> String {
+    super::dom::query_param("relay").unwrap_or_else(|| DEFAULT_RELAY.to_string())
 }
 
 fn other_role(role: &str) -> &'static str {
@@ -203,7 +237,7 @@ impl BroadcastTransport {
                         .and_then(|v| v.as_f64())
                         .unwrap_or(0.0);
                     if instance > theirs {
-                        sink(SignalEvent::RoleTaken { role: from });
+                        sink(SignalEvent::RoleTaken);
                     }
                     return;
                 }
@@ -517,5 +551,167 @@ mod tests {
         assert!(decode_blob("").is_err());
         assert!(decode_blob("no-separator-here").is_err());
         assert!(decode_blob("offer.!!!!").is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signaling relay
+// ---------------------------------------------------------------------------
+
+/// Pairs through a WebSocket signaling server.
+///
+/// This is the only transport that works between different browsers or
+/// different machines without human involvement. The server sees the SDP and
+/// nothing else: activations and tokens go peer to peer, and [`release`] hangs
+/// up the socket once the data channel is open.
+///
+/// [`release`]: RelayTransport::release
+pub struct RelayTransport {
+    socket: RefCell<Option<WebSocket>>,
+    role: String,
+    room: String,
+    sink: Sink,
+    /// Retained so the callbacks outlive this scope.
+    handlers: RefCell<Vec<JsHandler>>,
+}
+
+impl RelayTransport {
+    fn new(room: &str, role: &str, sink: Sink) -> Self {
+        let transport = RelayTransport {
+            socket: RefCell::new(None),
+            role: role.to_string(),
+            room: room.to_string(),
+            sink,
+            handlers: RefCell::new(Vec::new()),
+        };
+        transport.connect();
+        transport
+    }
+
+    fn connect(&self) {
+        let url = format!("{}?room={}&role={}", relay_endpoint(), self.room, self.role);
+
+        let socket = match WebSocket::new(&url) {
+            Ok(socket) => socket,
+            Err(e) => {
+                (self.sink)(SignalEvent::TransportError(format!(
+                    "could not reach the relay at {url}: {}",
+                    super::dom::js_error_string(&e)
+                )));
+                return;
+            }
+        };
+
+        let mut handlers = self.handlers.borrow_mut();
+
+        let on_message = {
+            let sink = Rc::clone(&self.sink);
+            Closure::<dyn FnMut(JsValue)>::new(move |event: JsValue| {
+                let Some(text) = js_sys::Reflect::get(&event, &JsValue::from_str("data"))
+                    .ok()
+                    .and_then(|d| d.as_string())
+                else {
+                    return;
+                };
+                let Ok(value) = js_sys::JSON::parse(&text) else {
+                    return;
+                };
+                let field = |key: &str| {
+                    js_sys::Reflect::get(&value, &JsValue::from_str(key))
+                        .ok()
+                        .and_then(|v| v.as_string())
+                };
+                let flag = |key: &str| {
+                    js_sys::Reflect::get(&value, &JsValue::from_str(key))
+                        .ok()
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                };
+
+                match field("type").as_deref() {
+                    Some("registered") => {
+                        sink(SignalEvent::Registered {
+                            polite: flag("polite"),
+                            room: field("room").unwrap_or_default(),
+                        });
+                        if flag("peerPresent") {
+                            sink(SignalEvent::PeerJoined);
+                        }
+                    }
+                    Some("peer-joined") => sink(SignalEvent::PeerJoined),
+                    Some("peer-left") => sink(SignalEvent::PeerLeft),
+                    Some("role-taken") => sink(SignalEvent::RoleTaken),
+                    Some("relay-full") => sink(SignalEvent::TransportError(
+                        "the relay is at capacity; try again shortly".to_string(),
+                    )),
+                    // Anything else is a peer's signal, forwarded verbatim.
+                    Some(kind) => {
+                        if let Some(body) = field("body") {
+                            match Signal::parse(kind, body) {
+                                Some(Signal::Offer(sdp)) => sink(SignalEvent::Offer(sdp)),
+                                Some(Signal::Answer(sdp)) => sink(SignalEvent::Answer(sdp)),
+                                Some(Signal::Ice(c)) => sink(SignalEvent::IceCandidate(c)),
+                                None => {}
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            })
+        };
+        socket.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+        handlers.push(on_message);
+
+        let on_error = {
+            let sink = Rc::clone(&self.sink);
+            let url = url.clone();
+            Closure::<dyn FnMut(JsValue)>::new(move |_: JsValue| {
+                sink(SignalEvent::TransportError(format!(
+                    "the relay connection failed ({url})"
+                )));
+            })
+        };
+        socket.set_onerror(Some(on_error.as_ref().unchecked_ref()));
+        handlers.push(on_error);
+
+        drop(handlers);
+        *self.socket.borrow_mut() = Some(socket);
+    }
+
+    fn send(&self, signal: Signal) {
+        let Some(socket) = self.socket.borrow().clone() else {
+            return;
+        };
+        if socket.ready_state() != WebSocket::OPEN {
+            // Queue nothing: the peer re-offers if a signal is lost, and a
+            // dropped candidate is recoverable.
+            return;
+        }
+        let payload = js_sys::Object::new();
+        for (key, value) in [("type", signal.kind()), ("body", signal.body())] {
+            let _ =
+                js_sys::Reflect::set(&payload, &JsValue::from_str(key), &JsValue::from_str(value));
+        }
+        if let Ok(text) = js_sys::JSON::stringify(&payload) {
+            if let Some(text) = text.as_string() {
+                let _ = socket.send_with_str(&text);
+            }
+        }
+    }
+
+    /// Hang up. The peers are connected directly now and need nothing further.
+    fn release(&self) {
+        if let Some(socket) = self.socket.borrow_mut().take() {
+            socket.set_onmessage(None);
+            socket.set_onerror(None);
+            let _ = socket.close();
+        }
+        self.handlers.borrow_mut().clear();
+    }
+}
+
+impl Drop for RelayTransport {
+    fn drop(&mut self) {
+        self.release();
     }
 }
