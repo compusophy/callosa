@@ -223,7 +223,12 @@ impl BroadcastTransport {
 
                 match kind.as_str() {
                     "announce" => {
-                        note_peer();
+                        {
+                            let mut s = state.borrow_mut();
+                            s.peer_seen_us = now_us();
+                            s.peer_present = true;
+                        }
+                        sink(SignalEvent::PeerJoined);
                         let _ = channel_for_reply
                             .post_message(&presence_message("present", &role, &room, instance));
                     }
@@ -275,6 +280,18 @@ impl BroadcastTransport {
                 }
             })
         };
+
+        // `Drop` never runs on navigation, so a departure has to be announced
+        // from an unload event or the surviving tab waits out the heartbeat.
+        {
+            let channel = channel.clone();
+            let role = role.to_string();
+            let room = room.to_string();
+            let target: web_sys::EventTarget = super::dom::window().into();
+            super::dom::on_event(&target, "pagehide", move |_| {
+                let _ = channel.post_message(&presence_message("leave", &role, &room, instance));
+            });
+        }
 
         let transport = BroadcastTransport {
             channel,

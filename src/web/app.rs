@@ -77,6 +77,8 @@ struct AppState {
     worker_queue: VecDeque<Vec<u8>>,
     worker_busy: bool,
     backend_label: String,
+    /// Whether the pairing transport currently sees the other role.
+    peer_present: bool,
 }
 
 pub struct App {
@@ -113,6 +115,7 @@ impl App {
                 worker_queue: VecDeque::new(),
                 worker_busy: false,
                 backend_label: String::new(),
+                peer_present: false,
             }),
         });
 
@@ -334,6 +337,7 @@ impl App {
             let mut state = self.state.borrow_mut();
             state.transport = None;
             state.transport_kind = kind;
+            state.peer_present = false;
             state.room = {
                 let room = self.refs.value("roomInput").trim().to_string();
                 if room.is_empty() {
@@ -390,6 +394,7 @@ impl App {
                 self.refs.set_text("topologyNote", "waiting for a peer");
             }
             SignalEvent::PeerJoined => {
+                self.state.borrow_mut().peer_present = true;
                 self.log("peer joined", Level::Ok);
                 self.refs
                     .set_text("topologyNote", "peer joined \u{2014} negotiating");
@@ -398,6 +403,7 @@ impl App {
                 }
             }
             SignalEvent::PeerLeft => {
+                self.state.borrow_mut().peer_present = false;
                 self.log("peer left", Level::Warn);
                 self.refs.set_text("topologyNote", "peer disconnected");
                 self.teardown_link();
@@ -483,6 +489,28 @@ impl App {
         }
     }
 
+    /// A failed connection is not recoverable in place: ICE restart still needs
+    /// a fresh offer. Rebuild it, but only from the offering side and only while
+    /// the peer is still announcing itself.
+    fn retry_pairing(self: &Rc<Self>) {
+        let (initiator, peer_present) = {
+            let state = self.state.borrow();
+            (state.initiator, state.peer_present)
+        };
+        if !initiator || !peer_present {
+            return;
+        }
+        let app = Rc::clone(self);
+        spawn_local(async move {
+            super::dom::sleep(1200).await;
+            // The peer may have gone for good while we waited.
+            if app.state.borrow().peer_present {
+                app.log("retrying the peer connection", Level::Warn);
+                app.start_pairing().await;
+            }
+        });
+    }
+
     async fn start_pairing(self: &Rc<Self>) {
         self.pill("pillLink", "busy", "peer link: negotiating");
         let link = self.ensure_link();
@@ -545,9 +573,11 @@ impl App {
                 self.log(&format!("peer connection state: {state}"), Level::Info);
                 match state.as_str() {
                     "connected" => self.pill("pillLink", "ok", "peer link: connected"),
-                    "failed" | "disconnected" => {
-                        self.pill("pillLink", "error", &format!("peer link: {state}"))
+                    "failed" => {
+                        self.pill("pillLink", "error", "peer link: failed");
+                        self.retry_pairing();
                     }
+                    "disconnected" => self.pill("pillLink", "warn", "peer link: disconnected"),
                     _ => {}
                 }
             }

@@ -3,6 +3,7 @@ name = "callosa"
 version = "0.1.0"
 edition = "2021"
 description = "Half a transformer per browser tab, with activations crossing a WebRTC data channel"
+repository = "https://github.com/compusophy/callosa"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
