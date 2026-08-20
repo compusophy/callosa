@@ -1,0 +1,19 @@
+{
+  "name": "callosa",
+  "version": "0.1.0",
+  "description": "Half a transformer per browser tab — Rust, WebAssembly, WebGPU and WebRTC, with no backend",
+  "type": "module",
+  "scripts": {
+    "build": "wasm-pack build --target web --out-dir ./public/pkg && node -e \"require('fs').rmSync('public/pkg/.gitignore',{force:true})\"",
+    "build:wasm": "npm run build",
+    "start": "node server.js",
+    "dev": "npm run build && node server.js",
+    "test": "cargo test",
+    "test:gpu": "cargo test --test kernels -- --nocapture",
+    "check": "cargo clippy --all-targets -- -D warnings && cargo clippy --lib --target wasm32-unknown-unknown -- -D warnings && cargo fmt --check",
+    "deploy": "npm run build && vercel deploy public --prod --yes"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

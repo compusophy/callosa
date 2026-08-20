@@ -1,0 +1,10 @@
+# Rust build output
+/target
+
+# wasm-pack output, produced by `npm run build`
+/public/pkg
+
+# Vercel CLI project linkage
+/.vercel
+
+/node_modules

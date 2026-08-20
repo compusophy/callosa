@@ -1,0 +1,9 @@
+# Only public/ is deployed; everything else is source or build output.
+target
+node_modules
+src
+tests
+Cargo.toml
+Cargo.lock
+rustfmt.toml
+server.js

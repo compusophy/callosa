@@ -1,0 +1,6 @@
+# Normalise to LF in the repository; check out native on Windows.
+* text=auto eol=lf
+
+*.wasm binary
+*.png binary
+*.jpg binary

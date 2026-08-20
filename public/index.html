@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>pipeline-parallel inference · webgpu + webrtc</title>
+    <meta
+      name="description"
+      content="Two browser tabs each run half a transformer on WebGPU and exchange activations over WebRTC."
+    />
+    <link rel="stylesheet" href="./style.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>⚡</text></svg>"
+    />
+  </head>
+  <body>
+    <div class="shell">
+      <header class="masthead">
+        <div>
+          <h1>pipeline-parallel inference across two browsers</h1>
+          <p>
+            each tab holds one transformer block on its own gpu; hidden states cross a webrtc data
+            channel
+          </p>
+        </div>
+        <div class="spec-strip" data-ref="specStrip"></div>
+      </header>
+
+      <div class="banner" data-ref="banner" data-tone="warn"></div>
+
+      <div class="pill-row">
+        <span class="pill" data-ref="pillWasm" data-state="busy"
+          ><span data-pill-label>wasm: loading</span></span
+        >
+        <span class="pill" data-ref="pillBackend" data-state="idle"
+          ><span data-pill-label>backend: pending</span></span
+        >
+        <span class="pill" data-ref="pillSignal" data-state="idle"
+          ><span data-pill-label>signaling: offline</span></span
+        >
+        <span class="pill" data-ref="pillLink" data-state="idle"
+          ><span data-pill-label>peer link: idle</span></span
+        >
+      </div>
+
+      <!-- ------------------------------------------------------------------ -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2>role &amp; pairing</h2>
+          <span class="panel-note" data-ref="pairNote">pick a role in each tab</span>
+        </div>
+        <div class="panel-body" style="display: flex; flex-direction: column; gap: 14px">
+          <div class="role-switch">
+            <label class="role-option" data-role="node0">
+              <input type="radio" name="role" value="node0" checked data-ref="roleNode0" />
+              <span class="role-name">node 0 — coordinator</span>
+              <span class="role-desc">embedding + block 0, drives the loop</span>
+            </label>
+            <label class="role-option" data-role="node1">
+              <input type="radio" name="role" value="node1" data-ref="roleNode1" />
+              <span class="role-desc" style="order: 2">block 1 + lm head, samples the token</span>
+              <span class="role-name">node 1 — worker</span>
+            </label>
+          </div>
+
+          <div class="control-grid">
+            <div class="field">
+              <label for="pairing">pairing</label>
+              <select id="pairing" data-ref="pairingMode">
+                <option value="broadcast">same browser &mdash; two tabs, no server</option>
+                <option value="manual">copy / paste &mdash; two devices</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="room">room</label>
+              <input type="text" id="room" data-ref="roomInput" value="default" spellcheck="false" />
+            </div>
+            <div class="field">
+              <label for="backendPref">compute backend</label>
+              <select id="backendPref" data-ref="backendPref">
+                <option value="gpu">webgpu (fall back to cpu)</option>
+                <option value="cpu">cpu reference kernels</option>
+              </select>
+            </div>
+            <div class="btn-row">
+              <button class="btn btn-primary" data-ref="btnPair">pair with peer</button>
+              <button class="btn" data-ref="btnReconnect">reconnect signaling</button>
+            </div>
+          </div>
+          <p class="hint" data-ref="pairingHint"></p>
+
+          <!-- shown only when pairing is set to copy / paste -->
+          <div class="manual-pairing" data-ref="manualPanel" hidden>
+            <div class="field">
+              <label for="manualOut" data-ref="manualOutLabel">1 · your blob — send it to the other device</label>
+              <textarea id="manualOut" data-ref="manualOut" rows="3" readonly
+                placeholder="press pair to generate"></textarea>
+              <div class="btn-row">
+                <button class="btn" data-ref="btnCopyBlob">copy</button>
+                <span class="panel-note" data-ref="manualOutNote">nothing yet</span>
+              </div>
+            </div>
+            <div class="field">
+              <label for="manualIn" data-ref="manualInLabel">2 · their blob — paste it here</label>
+              <textarea id="manualIn" data-ref="manualIn" rows="3" spellcheck="false"
+                placeholder="paste the blob from the other device"></textarea>
+              <div class="btn-row">
+                <button class="btn btn-primary" data-ref="btnApplyBlob">apply</button>
+                <span class="panel-note" data-ref="manualInNote"></span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ------------------------------------------------------------------ -->
+      <section class="panel">
+        <div class="panel-head">
+          <h2>topology</h2>
+          <span class="panel-note" data-ref="topologyNote">waiting for a peer</span>
+        </div>
+        <div class="panel-body">
+          <div class="topology">
+            <div class="node-card" data-node="node0" data-ref="cardNode0" data-active="true">
+              <div class="node-title">
+                <strong>node 0 · coordinator</strong>
+                <span class="node-tag" data-ref="node0Backend">—</span>
+              </div>
+              <div class="node-stack">
+                embed → rmsnorm → q/k/v → rope → attention<br />
+                → o-proj → residual → swiglu ffn → residual
+              </div>
+              <div class="stat-grid">
+                <div class="stat">
+                  <div class="stat-key">block compute</div>
+                  <div class="stat-val" data-ref="node0Compute">0.00 ms</div>
+                </div>
+                <div class="stat">
+                  <div class="stat-key">params held</div>
+                  <div class="stat-val" data-ref="node0Params">—</div>
+                </div>
+                <div class="stat">
+                  <div class="stat-key">tokens sent</div>
+                  <div class="stat-val" data-ref="node0Sent">0</div>
+                </div>
+              </div>
+            </div>
+
+            <div class="bridge">
+              <div class="bridge-label">webrtc data channel</div>
+              <div class="bridge-wire" data-ref="bridgeWire" data-live="false"></div>
+              <div class="bridge-rtt" data-ref="bridgeRtt">— ms</div>
+              <div class="bridge-label" data-ref="bridgeBytes">activation → token</div>
+              <div class="bridge-label" data-ref="bridgePath">path: —</div>
+            </div>
+
+            <div class="node-card" data-node="node1" data-ref="cardNode1" data-active="false">
+              <div class="node-title">
+                <strong>node 1 · worker</strong>
+                <span class="node-tag" data-ref="node1Backend">—</span>
+              </div>
+              <div class="node-stack">
+                rmsnorm → q/k/v → rope → attention → o-proj<br />
+                → residual → swiglu ffn → final norm → lm head → sample
+              </div>
+              <div class="stat-grid">
+                <div class="stat">
+                  <div class="stat-key">block compute</div>
+                  <div class="stat-val" data-ref="node1Compute">0.00 ms</div>
+                </div>
+                <div class="stat">
+                  <div class="stat-key">params held</div>
+                  <div class="stat-val" data-ref="node1Params">—</div>
+                </div>
+                <div class="stat">
+                  <div class="stat-key">tokens sampled</div>
+                  <div class="stat-val" data-ref="node1Tokens">0</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ------------------------------------------------------------------ -->
+      <div class="columns">
+        <div style="display: flex; flex-direction: column; gap: 20px">
+          <section class="panel" data-ref="generatePanel">
+            <div class="panel-head">
+              <h2>generation</h2>
+              <span class="panel-note" data-ref="stepNote">idle</span>
+            </div>
+            <div class="panel-body" style="display: flex; flex-direction: column; gap: 14px">
+              <div class="field">
+                <label for="prompt">prompt</label>
+                <textarea
+                  id="prompt"
+                  data-ref="promptInput"
+                  spellcheck="false"
+                  placeholder="distributed gpu compute pipeline"
+                >
+distributed gpu compute pipeline</textarea
+                >
+              </div>
+
+              <div class="control-grid">
+                <div class="field">
+                  <label for="maxTokens">max tokens</label>
+                  <input type="number" id="maxTokens" data-ref="maxTokens" value="24" min="1" max="128" />
+                </div>
+                <div class="field">
+                  <label for="temperature">temperature</label>
+                  <input
+                    type="number"
+                    id="temperature"
+                    data-ref="temperature"
+                    value="0.85"
+                    min="0"
+                    max="2"
+                    step="0.05"
+                  />
+                </div>
+                <div class="field">
+                  <label for="topK">top-k</label>
+                  <input type="number" id="topK" data-ref="topK" value="8" min="0" max="64" />
+                </div>
+                <div class="field">
+                  <label for="codec">activation codec</label>
+                  <select id="codec" data-ref="codec">
+                    <option value="0">f32 — lossless</option>
+                    <option value="1">int8 + scale — 4x smaller</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="btn-row">
+                <button class="btn btn-primary" data-ref="btnGenerate" disabled>
+                  run pipeline
+                </button>
+                <button class="btn btn-danger" data-ref="btnStop" hidden>stop</button>
+                <button class="btn" data-ref="btnClear">clear transcript</button>
+                <span class="panel-note" data-ref="throughput" style="margin-left: auto"
+                  >— tok/s</span
+                >
+              </div>
+
+              <div class="transcript" data-ref="transcriptScroll">
+                <div data-ref="transcript">
+                  <span class="transcript-prompt" data-ref="transcriptPrompt"></span>
+                  <span class="caret" data-ref="caret" hidden></span>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>tensors on the wire</h2>
+              <span class="panel-note" data-ref="tensorNote">no traffic yet</span>
+            </div>
+            <div class="panel-body" style="display: flex; flex-direction: column; gap: 16px">
+              <div class="canvas-block">
+                <div class="canvas-head">
+                  <span data-ref="activationLabel">hidden state leaving this node</span>
+                  <span data-ref="activationStats">norm — · peak —</span>
+                </div>
+                <canvas data-ref="activationCanvas"></canvas>
+              </div>
+              <div class="canvas-block">
+                <div class="canvas-head">
+                  <span>per-token latency breakdown</span>
+                  <span data-ref="latencyStats">—</span>
+                </div>
+                <canvas class="tall" data-ref="latencyCanvas"></canvas>
+                <div class="legend">
+                  <span class="l-local">node 0 compute</span>
+                  <span class="l-net">network</span>
+                  <span class="l-remote">node 1 compute</span>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <div style="display: flex; flex-direction: column; gap: 20px">
+          <section class="panel">
+            <div class="panel-head">
+              <h2>local shard</h2>
+              <span class="panel-note" data-ref="shardNote">not initialised</span>
+            </div>
+            <div class="panel-body">
+              <div class="stat-grid" style="grid-template-columns: 1fr 1fr">
+                <div class="stat">
+                  <div class="stat-key">device</div>
+                  <div class="stat-val" style="font-size: 12px" data-ref="shardDevice">—</div>
+                </div>
+                <div class="stat">
+                  <div class="stat-key">dispatches / token</div>
+                  <div class="stat-val" data-ref="shardDispatches">—</div>
+                </div>
+                <div class="stat">
+                  <div class="stat-key">mean compute</div>
+                  <div class="stat-val" data-ref="shardMean">0.00 ms</div>
+                </div>
+                <div class="stat">
+                  <div class="stat-key">context left</div>
+                  <div class="stat-val" data-ref="shardContext">—</div>
+                </div>
+              </div>
+              <details style="margin-top: 12px">
+                <summary class="panel-note" style="cursor: pointer">kernel schedule per token</summary>
+                <div
+                  class="node-stack"
+                  data-ref="kernelTrace"
+                  style="margin-top: 8px; white-space: pre-wrap"
+                ></div>
+              </details>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head">
+              <h2>event log</h2>
+              <button class="btn" data-ref="btnClearLog" style="padding: 3px 9px; font-size: 11px">
+                clear
+              </button>
+            </div>
+            <div class="log" data-ref="log"></div>
+          </section>
+        </div>
+      </div>
+
+      <div class="footer" data-ref="footer">
+        rust · wasm · wgpu · webrtc — weights are synthesised from a shared seed, so nothing but
+        activations and tokens crosses the wire
+      </div>
+    </div>
+
+    <!-- The only script on the page: load the wasm module and let it take over.
+         Its `#[wasm_bindgen(start)]` builds the entire UI from Rust. -->
+    <script type="module">
+      import init from './pkg/callosa.js';
+      init().catch((err) => {
+        document.querySelector('[data-ref="banner"]').dataset.visible = 'true';
+        document.querySelector('[data-ref="banner"]').dataset.tone = 'error';
+        document.querySelector('[data-ref="banner"]').textContent =
+          `the wasm module failed to load: ${err}. run "npm run build" first.`;
+      });
+    </script>
+  </body>
+</html>
