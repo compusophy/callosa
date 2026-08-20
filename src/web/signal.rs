@@ -167,7 +167,7 @@ impl Transport {
 
 /// Default signaling endpoint, overridable at runtime with `?relay=wss://...`
 /// so a fork can point at its own without rebuilding.
-pub const DEFAULT_RELAY: &str = "wss://callosa-relay.up.railway.app/ws";
+pub const DEFAULT_RELAY: &str = "wss://callosa-relay-production.up.railway.app/ws";
 
 pub fn relay_endpoint() -> String {
     super::dom::query_param("relay").unwrap_or_else(|| DEFAULT_RELAY.to_string())
