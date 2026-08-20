@@ -284,9 +284,13 @@ changed. The archive notes the differences.
   Across devices, use the relay or copy/paste.
 - The relay keeps no state and has no authentication. Room ids are the only
   thing standing between two sessions, which is why they are random.
-- No TURN server, so two peers behind symmetric NATs may fail to connect. STUN
-  covers the common cases; the candidate path is shown in the topology panel so
-  a failure is diagnosable rather than mysterious.
+- STUN first, TURN as a fallback. Behind symmetric NAT the initial checks can
+  succeed and the path then die seconds later, which looks like a connection
+  that comes up and drops. TURN fixes that, but **when the selected pair is
+  `relay` the activations flow through the TURN server** rather than peer to
+  peer. The topology panel names the candidate types precisely so you can see
+  when that is happening. Point at your own with
+  `?turn=turn:host:port&turn_user=&turn_pass=`.
 - Random weights. Swapping in a trained checkpoint means replacing
   `config::synthesize` and shipping the tensors — the execution path does not
   change.

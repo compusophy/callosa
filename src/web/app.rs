@@ -80,6 +80,9 @@ struct AppState {
     backend_label: String,
     /// Whether the pairing transport currently sees the other role.
     peer_present: bool,
+    /// Guards against stacking reconnect attempts when several failure events
+    /// arrive together.
+    reconnecting: bool,
 }
 
 pub struct App {
@@ -128,6 +131,7 @@ impl App {
                 worker_busy: false,
                 backend_label: String::new(),
                 peer_present: false,
+                reconnecting: false,
             }),
         });
 
@@ -558,27 +562,35 @@ impl App {
     }
 
     /// A failed connection is not recoverable in place: ICE restart still needs
-    /// a fresh offer. Rebuild it, but only from the offering side and only while
-    /// the peer is still announcing itself.
+    /// a fresh offer.
+    ///
+    /// Both roles rejoin signaling, not just the offering one. node 1 answers
+    /// offers rather than making them, so if it stays disconnected from the
+    /// relay there is nothing for node 0 to re-offer *to* and the pair is stuck
+    /// for good -- which is exactly what a failed link used to leave behind.
     fn retry_pairing(self: &Rc<Self>) {
-        let (initiator, peer_present, kind) = {
-            let state = self.state.borrow();
-            (state.initiator, state.peer_present, state.transport_kind)
-        };
-        if !initiator {
+        let kind = self.state.borrow().transport_kind;
+        if self.state.borrow().reconnecting {
             return;
         }
-        // The signaling socket is dropped once paired, so it has to come back
-        // before a fresh offer can reach anyone.
-        if !peer_present || kind == TransportKind::Relay {
-            self.attach_transport(kind);
-            return;
-        }
+        self.state.borrow_mut().reconnecting = true;
+
         let app = Rc::clone(self);
         spawn_local(async move {
-            super::dom::sleep(1200).await;
-            // The peer may have gone for good while we waited.
-            if app.state.borrow().peer_present {
+            super::dom::sleep(1500).await;
+            app.state.borrow_mut().reconnecting = false;
+
+            // Signaling is dropped once paired, so it has to come back before
+            // any offer can reach anyone.
+            app.attach_transport(kind);
+
+            // Give the peer a moment to rejoin before offering into an empty room.
+            super::dom::sleep(1500).await;
+            let (initiator, peer_present) = {
+                let state = app.state.borrow();
+                (state.initiator, state.peer_present)
+            };
+            if initiator && peer_present {
                 app.log("retrying the peer connection", Level::Warn);
                 app.start_pairing().await;
             }
@@ -647,11 +659,29 @@ impl App {
                 self.log(&format!("peer connection state: {state}"), Level::Info);
                 match state.as_str() {
                     "connected" => self.pill("pillLink", "ok", "peer link: connected"),
-                    "failed" => {
-                        self.pill("pillLink", "error", "peer link: failed");
+                    "failed" | "closed" => {
+                        self.pill("pillLink", "error", &format!("peer link: {state}"));
                         self.retry_pairing();
                     }
-                    "disconnected" => self.pill("pillLink", "warn", "peer link: disconnected"),
+                    "disconnected" => {
+                        self.pill("pillLink", "warn", "peer link: disconnected");
+                        // Often transient, so this only rebuilds if it is still
+                        // not carrying traffic a few seconds later.
+                        let app = Rc::clone(self);
+                        spawn_local(async move {
+                            super::dom::sleep(6000).await;
+                            let dead = app
+                                .state
+                                .borrow()
+                                .peer
+                                .as_ref()
+                                .map(|p| !p.is_open())
+                                .unwrap_or(true);
+                            if dead {
+                                app.retry_pairing();
+                            }
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -700,15 +730,17 @@ impl App {
         }
     }
 
-    /// Hang up the signaling connection a moment after pairing succeeds.
+    /// Hang up the signaling connection once the link has proven itself.
     ///
-    /// The delay covers a link that fails immediately. After this the relay
-    /// holds no connection for this peer at all, so its concurrent load tracks
-    /// how many peers are *pairing* rather than how many exist.
+    /// The wait matters: WebRTC re-checks consent every few seconds, so a path
+    /// that came up can still collapse shortly after, and letting go of
+    /// signaling early removes the route back. Waiting long enough to clear
+    /// several consent cycles costs the relay almost nothing -- its load still
+    /// tracks peers that are pairing rather than peers that exist.
     fn release_signaling(self: &Rc<Self>) {
         let app = Rc::clone(self);
         spawn_local(async move {
-            super::dom::sleep(5000).await;
+            super::dom::sleep(25_000).await;
             let still_open = app
                 .state
                 .borrow()

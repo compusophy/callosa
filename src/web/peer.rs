@@ -42,15 +42,61 @@ pub enum PeerEvent {
 
 type Sink = Rc<dyn Fn(PeerEvent)>;
 
+/// STUN alone only works when at least one side is directly reachable once a
+/// hole is punched. Behind symmetric NAT -- common on mobile networks and some
+/// corporate wifi -- the initial checks can succeed and then the path dies,
+/// which looks exactly like a connection that comes up and drops seconds later.
+///
+/// TURN is the fallback for that: it relays the flow when no direct path
+/// survives. The trade is real and worth stating plainly -- when the selected
+/// pair is `relay`, activations pass through the TURN server rather than going
+/// peer to peer. The topology panel names the candidate types for exactly this
+/// reason, so you can see when it happens.
+const STUN_URLS: [&str; 2] = [
+    "stun:stun.l.google.com:19302",
+    "stun:stun1.l.google.com:19302",
+];
+
+/// Public TURN, overridable with `?turn=turn:host:port` plus `?turn_user=` and
+/// `?turn_pass=` when you would rather not depend on someone else's.
+const TURN_URLS: [&str; 3] = [
+    "turn:openrelay.metered.ca:80",
+    "turn:openrelay.metered.ca:443",
+    "turn:openrelay.metered.ca:443?transport=tcp",
+];
+const TURN_USER: &str = "openrelayproject";
+const TURN_PASS: &str = "openrelayproject";
+
+fn ice_server(urls: &str, credentials: Option<(&str, &str)>) -> js_sys::Object {
+    let server = js_sys::Object::new();
+    let set = |key: &str, value: &str| {
+        let _ = js_sys::Reflect::set(&server, &JsValue::from_str(key), &JsValue::from_str(value));
+    };
+    set("urls", urls);
+    if let Some((user, pass)) = credentials {
+        set("username", user);
+        set("credential", pass);
+    }
+    server
+}
+
 fn ice_servers() -> JsValue {
     let servers = js_sys::Array::new();
-    for url in [
-        "stun:stun.l.google.com:19302",
-        "stun:stun1.l.google.com:19302",
-    ] {
-        let server = js_sys::Object::new();
-        let _ = js_sys::Reflect::set(&server, &JsValue::from_str("urls"), &JsValue::from_str(url));
-        servers.push(&server);
+    for url in STUN_URLS {
+        servers.push(&ice_server(url, None));
+    }
+
+    match super::dom::query_param("turn") {
+        Some(url) => {
+            let user = super::dom::query_param("turn_user").unwrap_or_default();
+            let pass = super::dom::query_param("turn_pass").unwrap_or_default();
+            servers.push(&ice_server(&url, Some((&user, &pass))));
+        }
+        None => {
+            for url in TURN_URLS {
+                servers.push(&ice_server(url, Some((TURN_USER, TURN_PASS))));
+            }
+        }
     }
     servers.into()
 }
@@ -109,6 +155,19 @@ impl PeerLink {
             })
         };
         connection.set_onconnectionstatechange(Some(on_state.as_ref().unchecked_ref()));
+
+        // ICE reaches `disconnected` well before the connection does, so this is
+        // the earliest honest signal that a path has stopped carrying traffic.
+        let on_ice_state = {
+            let sink = Rc::clone(&sink);
+            let pc = connection.clone();
+            Closure::<dyn FnMut(Event)>::new(move |_: Event| {
+                let state = format!("{:?}", pc.ice_connection_state()).to_lowercase();
+                sink(PeerEvent::Log(format!("ice: {state}")));
+            })
+        };
+        connection.set_oniceconnectionstatechange(Some(on_ice_state.as_ref().unchecked_ref()));
+        on_ice_state.forget();
 
         let link = Rc::new(PeerLink {
             connection,
