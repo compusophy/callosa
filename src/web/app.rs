@@ -411,7 +411,12 @@ impl App {
                 if looking {
                     app.banner(
                         "warn",
-                        "no peer found. \u{201c}same browser\u{201d} pairing only sees other tabs in                          THIS browser \u{2014} it cannot reach a different browser or another device.                          switch pairing to \u{201c}relay\u{201d} for those.",
+                        concat!(
+                            "no peer found. \u{201c}same browser\u{201d} pairing only sees ",
+                            "other tabs in THIS browser \u{2014} it cannot reach a different ",
+                            "browser or another device. switch pairing to ",
+                            "\u{201c}relay\u{201d} for those.",
+                        ),
                     );
                     app.log(
                         "no peer in this browser; other browsers and devices need relay pairing",
@@ -510,14 +515,25 @@ impl App {
                 }
             }
             SignalEvent::TransportError(message) => {
-                self.pill("pillSignal", "error", "pairing: relay unreachable");
-                self.banner(
-                    "error",
-                    &format!(
-                        "{message}. switch pairing to \u{201c}copy / paste\u{201d} to connect without a relay,                          or pass ?relay=wss://your-relay/ws to use another one."
-                    ),
-                );
+                self.pill("pillSignal", "warn", "pairing: relay unreachable");
                 self.log(&message, Level::Error);
+
+                // A dead relay should not leave the page unable to pair at all.
+                // Fall back to same-browser so two tabs still work, and say
+                // plainly what that costs.
+                if self.state.borrow().transport_kind == TransportKind::Relay {
+                    self.banner(
+                        "warn",
+                        concat!(
+                            "the signaling relay is unreachable, so pairing fell back to ",
+                            "\u{201c}same browser\u{201d} \u{2014} two tabs here still work. ",
+                            "to pair with another device choose \u{201c}copy / paste\u{201d}, ",
+                            "or point at a relay with ?relay=wss://your-relay/ws",
+                        ),
+                    );
+                    self.refs.set_value("pairingMode", "broadcast");
+                    self.attach_transport(TransportKind::Broadcast);
+                }
             }
             SignalEvent::Blob { kind, blob } => {
                 self.refs.set_value("manualOut", &blob);
